@@ -1,22 +1,74 @@
 import json
 import os
+import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from google import genai
 from google.genai import types
 
 
 MODEL = "gemma-3-12b-it"
+
 MAX_FILE_BYTES = 400_000
 MAX_TOOL_CALLS_PER_TURN = 8
+
+MAX_TOOL_RESULT_CHARS = 20_000
+LIST_FILES_MAX_ITEMS = 250
+
+DEFAULT_IGNORED_DIRS = {
+    ".git",
+    ".idea",
+    ".pytest_cache",
+    ".mypy_cache",
+    "__pycache__",
+    "node_modules",
+    "venv",
+    ".venv",
+    "dist",
+    "build",
+}
 
 BLUE = "\033[94m"
 YELLOW = "\033[93m"
 GREEN = "\033[92m"
 RESET = "\033[0m"
+
+
+def load_dotenv(dotenv_path: Path) -> Dict[str, str]:
+    """
+    Minimal .env loader.
+
+    Supports KEY=VALUE.
+    Ignores blank lines and lines starting with #.
+    Strips surrounding single or double quotes from VALUE.
+    """
+    env: Dict[str, str] = {}
+    if not dotenv_path.exists():
+        return env
+
+    for raw_line in dotenv_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if len(value) >= 2 and (
+            (value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")
+        ):
+            value = value[1:-1]
+
+        env[key] = value
+
+    return env
 
 
 @dataclass
@@ -27,12 +79,12 @@ class ToolDefinition:
     func: Callable[[Dict[str, Any]], str]
 
 
-def _safe_resolve_rel_path(base_dir: Path, rel_path: str) -> Path:
+def safe_resolve_rel_path(base_dir: Path, rel_path: str) -> Path:
     base_dir = base_dir.resolve()
     candidate = (base_dir / rel_path).resolve()
-    if base_dir not in candidate.parents and candidate != base_dir:
-        raise ValueError("path escapes working directory")
-    return candidate
+    if candidate == base_dir or base_dir in candidate.parents:
+        return candidate
+    raise ValueError("path escapes working directory")
 
 
 def tool_read_file(args: Dict[str, Any], base_dir: Path) -> str:
@@ -40,13 +92,14 @@ def tool_read_file(args: Dict[str, Any], base_dir: Path) -> str:
     if not isinstance(path, str) or not path:
         raise ValueError("missing path")
 
-    full_path = _safe_resolve_rel_path(base_dir, path)
+    full_path = safe_resolve_rel_path(base_dir, path)
     if full_path.is_dir():
         raise ValueError("path is a directory")
 
     data = full_path.read_bytes()
     if len(data) > MAX_FILE_BYTES:
         raise ValueError("file too large")
+
     return data.decode("utf-8", errors="replace")
 
 
@@ -57,26 +110,34 @@ def tool_list_files(args: Dict[str, Any], base_dir: Path) -> str:
     if not isinstance(rel, str):
         raise ValueError("path must be a string")
 
-    start = _safe_resolve_rel_path(base_dir, rel) if rel else base_dir.resolve()
+    start = safe_resolve_rel_path(base_dir, rel) if rel else base_dir.resolve()
     if not start.exists():
         raise ValueError("path not found")
+
     if start.is_file():
         return json.dumps([str(Path(rel))])
 
     items: List[str] = []
-    for root, dirs, files in os.walk(start):
-        root_path = Path(root)
-        rel_root = root_path.relative_to(start)
-        if str(rel_root) != ".":
-            items.append(str(rel_root) + "/")
-        for d in dirs:
-            p = (rel_root / d)
-            items.append(str(p) + "/")
-        for f in files:
-            p = (rel_root / f)
-            items.append(str(p))
-    items = sorted(set(items))
-    return json.dumps(items)
+    try:
+        with os.scandir(start) as it:
+            for entry in it:
+                name = entry.name
+
+                if entry.is_dir(follow_symlinks=False) and name in DEFAULT_IGNORED_DIRS:
+                    continue
+
+                if entry.is_dir(follow_symlinks=False):
+                    items.append(name + "/")
+                else:
+                    items.append(name)
+
+                if len(items) >= LIST_FILES_MAX_ITEMS:
+                    break
+    except PermissionError:
+        raise ValueError("permission denied")
+
+    items = sorted(items)
+    return json.dumps(items, ensure_ascii=False)
 
 
 def tool_edit_file(args: Dict[str, Any], base_dir: Path) -> str:
@@ -91,7 +152,7 @@ def tool_edit_file(args: Dict[str, Any], base_dir: Path) -> str:
     if old_str == new_str:
         raise ValueError("old_str and new_str must be different")
 
-    full_path = _safe_resolve_rel_path(base_dir, path)
+    full_path = safe_resolve_rel_path(base_dir, path)
     full_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not full_path.exists():
@@ -101,6 +162,7 @@ def tool_edit_file(args: Dict[str, Any], base_dir: Path) -> str:
         return f"created {path}"
 
     content = full_path.read_text(encoding="utf-8", errors="replace")
+
     if old_str == "":
         raise ValueError("old_str must not be empty when editing an existing file")
 
@@ -115,50 +177,184 @@ def tool_edit_file(args: Dict[str, Any], base_dir: Path) -> str:
     return "OK"
 
 
-def _strip_code_fences(text: str) -> str:
-    t = text.strip()
-    if t.startswith("```"):
-        lines = t.splitlines()
-        if len(lines) >= 3 and lines[-1].strip() == "```":
-            return "\n".join(lines[1:-1]).strip()
-    return t
+def _extract_fenced_payload(text: str) -> Optional[str]:
+    m = re.search(r"```(?:json)?\s*", text, flags=re.IGNORECASE)
+    if not m:
+        return None
+
+    after = text[m.end() :]
+    close_idx = after.find("```")
+    if close_idx == -1:
+        return after.strip()
+
+    return after[:close_idx].strip()
 
 
-def _extract_json_object(text: str) -> Optional[str]:
-    t = _strip_code_fences(text)
-    if t.startswith("{") and t.endswith("}"):
-        return t
-    start = t.find("{")
-    end = t.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return t[start : end + 1].strip()
+def _extract_first_json_object(s: str) -> Optional[str]:
+    start = s.find("{")
+    if start == -1:
+        return None
+
+    in_str = False
+    esc = False
+    depth = 0
+
+    for i in range(start, len(s)):
+        ch = s[i]
+
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+
+        if ch == '"':
+            in_str = True
+            continue
+
+        if ch == "{":
+            depth += 1
+            continue
+
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1].strip()
+            continue
+
+    return s[start:].strip()
+
+
+def _repair_unbalanced_json(s: str) -> str:
+    start = s.find("{")
+    if start == -1:
+        return s.strip()
+
+    s = s[start:]
+
+    in_str = False
+    esc = False
+    stack: List[str] = []
+    out: List[str] = []
+
+    for ch in s:
+        out.append(ch)
+
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+
+        if ch == '"':
+            in_str = True
+            continue
+
+        if ch == "{":
+            stack.append("{")
+            continue
+
+        if ch == "[":
+            stack.append("[")
+            continue
+
+        if ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+            continue
+
+        if ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+            continue
+
+    for opener in reversed(stack):
+        out.append("}" if opener == "{" else "]")
+
+    return "".join(out).strip()
+
+
+def extract_json_object(text: str) -> Optional[str]:
+    payload = _extract_fenced_payload(text)
+    if payload is None:
+        payload = text
+
+    blob = _extract_first_json_object(payload)
+    if blob:
+        return blob
+
     return None
 
 
-def parse_tool_calls(model_text: str) -> Optional[List[Dict[str, Any]]]:
-    blob = _extract_json_object(model_text)
-    if not blob:
-        return None
+def _json_loads_lenient(blob: str) -> Optional[Dict[str, Any]]:
     try:
         obj = json.loads(blob)
+        if isinstance(obj, dict):
+            return obj
+        return None
     except Exception:
+        repaired = _repair_unbalanced_json(blob)
+        try:
+            obj = json.loads(repaired)
+            if isinstance(obj, dict):
+                return obj
+            return None
+        except Exception:
+            return None
+
+
+def parse_tool_calls(model_text: str) -> Optional[List[Dict[str, Any]]]:
+    blob = extract_json_object(model_text)
+    if not blob:
         return None
 
-    if not isinstance(obj, dict):
+    obj = _json_loads_lenient(blob)
+    if not obj:
         return None
+
     calls = obj.get("tool_calls")
     if not isinstance(calls, list) or not calls:
         return None
 
-    normalized: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     for c in calls:
         if not isinstance(c, dict):
             continue
         name = c.get("name")
         args = c.get("args")
         if isinstance(name, str) and isinstance(args, dict):
-            normalized.append({"name": name, "args": args})
-    return normalized or None
+            out.append({"name": name, "args": args})
+
+    return out or None
+
+
+def _extract_retry_seconds(err_text: str) -> Optional[float]:
+    m = re.search(r"Please retry in ([0-9.]+)s", err_text)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    m = re.search(r"retryDelay['\"]:\s*['\"]([0-9]+)s['\"]", err_text)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    return None
+
+
+def _truncate_tool_result(text: str) -> str:
+    if len(text) <= MAX_TOOL_RESULT_CHARS:
+        return text
+    head = text[:MAX_TOOL_RESULT_CHARS]
+    return head + "\n\n[TRUNCATED TOOL RESULT]"
 
 
 SYSTEM_INSTRUCTION = """
@@ -167,24 +363,24 @@ You are a code editing assistant running inside a local folder.
 You have access to these tools:
 
 1) read_file
-Description: Read a text file at a relative path.
-Input JSON schema: {"type":"object","properties":{"path":{"type":"string","description":"relative file path"}},"required":["path"]}
+Read a text file at a relative path.
 
 2) list_files
-Description: List files and directories at an optional relative path. Returns a JSON list of strings. Directories end with "/".
-Input JSON schema: {"type":"object","properties":{"path":{"type":"string","description":"optional relative path"}}}
+List files and directories at an optional relative path.
+Returns a JSON list of strings. Directories end with "/".
 
 3) edit_file
-Description: Edit a text file by replacing old_str with new_str.
+Edit a text file by replacing old_str with new_str.
 Rules:
 - old_str and new_str must be different
 - if the file does not exist, you may create it only when old_str is an empty string
 - if editing an existing file, old_str must match exactly once
-Input JSON schema: {"type":"object","properties":{"path":{"type":"string"},"old_str":{"type":"string"},"new_str":{"type":"string"}},"required":["path","old_str","new_str"]}
 
 How to call tools:
 If you want to use tools, respond with ONLY valid JSON and nothing else, in this exact shape:
 {"tool_calls":[{"name":"read_file","args":{"path":"main.py"}}]}
+
+Do not wrap JSON in markdown or code fences.
 
 You may request multiple tool calls at once:
 {"tool_calls":[{"name":"list_files","args":{}},{"name":"read_file","args":{"path":"main.py"}}]}
@@ -200,7 +396,10 @@ class Agent:
     def __init__(self, client: genai.Client, base_dir: Path):
         self.client = client
         self.base_dir = base_dir.resolve()
-        self.conversation: List[types.Content] = []
+
+        self.conversation: List[types.Content] = [
+            types.Content(role="user", parts=[types.Part(text=SYSTEM_INSTRUCTION)])
+        ]
 
         self.tools: Dict[str, ToolDefinition] = {
             "read_file": ToolDefinition(
@@ -238,27 +437,36 @@ class Agent:
             ),
         }
 
-    def _gen_config(self) -> types.GenerateContentConfig:
-        return types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.2,
-            max_output_tokens=2048,
-        )
+    def _trim_conversation(self, keep_last: int = 18) -> None:
+        if len(self.conversation) > keep_last + 1:
+            first = self.conversation[0]
+            self.conversation = [first] + self.conversation[-keep_last:]
 
-    def _trim_conversation(self, keep_last: int = 24) -> None:
-        if len(self.conversation) > keep_last:
-            self.conversation = self.conversation[-keep_last:]
+    def _generate_with_retry(self) -> types.GenerateContentResponse:
+        attempts = 0
+        while True:
+            try:
+                return self.client.models.generate_content(
+                    model=MODEL,
+                    contents=self.conversation,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        max_output_tokens=1024,
+                    ),
+                )
+            except Exception as e:
+                attempts += 1
+                text = str(e)
 
-    def _model_turn(self) -> types.GenerateContentResponse:
-        self._trim_conversation()
-        return self.client.models.generate_content(
-            model=MODEL,
-            contents=self.conversation,
-            config=self._gen_config(),
-        )
+                is_429 = (" 429 " in text) or ("RESOURCE_EXHAUSTED" in text) or text.startswith("429")
+                if (not is_429) or attempts >= 6:
+                    raise
 
-    def _append_user_text(self, text: str) -> None:
-        self.conversation.append(types.Content(role="user", parts=[types.Part(text=text)]))
+                retry_s = _extract_retry_seconds(text)
+                if retry_s is None:
+                    retry_s = min(2.0 ** attempts, 20.0)
+
+                time.sleep(retry_s)
 
     def run(self) -> None:
         print("Chat with Gemma (ctrl c to quit)")
@@ -270,17 +478,18 @@ class Agent:
                     user_input = input(f"{BLUE}You{RESET}: ")
                 except EOFError:
                     break
-                self._append_user_text(user_input)
+                self.conversation.append(types.Content(role="user", parts=[types.Part(text=user_input)]))
 
-            resp = self._model_turn()
-            content = resp.candidates[0].content
-            self.conversation.append(content)
+            self._trim_conversation()
 
-            text = resp.text or ""
-            tool_calls = parse_tool_calls(text)
+            response = self._generate_with_retry()
 
+            model_text = response.text or ""
+            self.conversation.append(types.Content(role="model", parts=[types.Part(text=model_text)]))
+
+            tool_calls = parse_tool_calls(model_text)
             if not tool_calls:
-                print(f"{YELLOW}Gemma{RESET}: {text}")
+                print(f"{YELLOW}Gemma{RESET}: {model_text}")
                 read_user_input = True
                 continue
 
@@ -295,28 +504,50 @@ class Agent:
 
                 tool = self.tools.get(name)
                 if not tool:
-                    tool_results.append(
-                        {"name": name, "ok": False, "result": "tool not found"}
-                    )
+                    tool_results.append({"name": name, "ok": False, "result": "tool not found"})
                     continue
 
                 try:
                     result = tool.func(args)
+                    result = _truncate_tool_result(result)
                     tool_results.append({"name": name, "ok": True, "result": result})
                 except Exception as e:
                     tool_results.append({"name": name, "ok": False, "result": str(e)})
 
-            self._append_user_text(json.dumps({"tool_results": tool_results}, ensure_ascii=False))
+            self.conversation.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=json.dumps({"tool_results": tool_results}, ensure_ascii=False))],
+                )
+            )
             read_user_input = False
 
 
 def main() -> None:
-    if not os.environ.get("GEMINI_API_KEY"):
-        print("Missing GEMINI_API_KEY in environment")
+    repo_root = Path(__file__).resolve().parent.parent
+    dotenv_path = repo_root / ".env"
+
+    env = load_dotenv(dotenv_path)
+
+    for k, v in env.items():
+        if k and v:
+            os.environ[k] = v
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        print(f"Missing GEMINI_API_KEY. Expected it in {dotenv_path}")
         sys.exit(1)
 
-    client = genai.Client()
-    agent = Agent(client=client, base_dir=Path.cwd())
+    if len(api_key) < 20:
+        print("GEMINI_API_KEY looks too short, check your .env file, it may be truncated")
+        sys.exit(1)
+
+    print(f"Using GEMINI_API_KEY: {api_key[:4]}...{api_key[-4:]} (len {len(api_key)})")
+
+    os.environ.pop("GOOGLE_API_KEY", None)
+
+    client = genai.Client(api_key=api_key)
+    agent = Agent(client=client, base_dir=repo_root)
     agent.run()
 
 
