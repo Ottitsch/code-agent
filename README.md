@@ -8,6 +8,7 @@ go to [aistudio](https://aistudio.google.com/) to get your free api key and crea
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
+cd agents
 python gemini.py
 ```
 
