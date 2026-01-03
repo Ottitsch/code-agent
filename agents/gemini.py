@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
@@ -36,39 +37,6 @@ BLUE = "\033[94m"
 YELLOW = "\033[93m"
 GREEN = "\033[92m"
 RESET = "\033[0m"
-
-
-def load_dotenv(dotenv_path: Path) -> Dict[str, str]:
-    """
-    Minimal .env loader.
-
-    Supports KEY=VALUE.
-    Ignores blank lines and lines starting with #.
-    Strips surrounding single or double quotes from VALUE.
-    """
-    env: Dict[str, str] = {}
-    if not dotenv_path.exists():
-        return env
-
-    for raw_line in dotenv_path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-
-        if len(value) >= 2 and (
-            (value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")
-        ):
-            value = value[1:-1]
-
-        env[key] = value
-
-    return env
 
 
 @dataclass
@@ -524,14 +492,10 @@ class Agent:
 
 
 def main() -> None:
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = (Path(__file__).resolve().parent / "..").resolve()
     dotenv_path = repo_root / ".env"
 
-    env = load_dotenv(dotenv_path)
-
-    for k, v in env.items():
-        if k and v:
-            os.environ[k] = v
+    load_dotenv(dotenv_path)
 
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
